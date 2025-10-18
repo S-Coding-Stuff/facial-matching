@@ -1,0 +1,16 @@
+# Ignore celebrity and other photo datasets
+celebrity_dataset/
+cartoon_dataset/
+models/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+PyDev_Env/
+venv/
