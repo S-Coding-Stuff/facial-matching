@@ -2,7 +2,6 @@ numpy>=1.24
 pillow>=10.0
 opencv-contrib-python>=4.8
 onnxruntime>=1.18
-annoy>=1.17
 transformers>=4.41
 tqdm>=4.66
 requests>=2.31

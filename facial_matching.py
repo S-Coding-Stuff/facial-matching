@@ -1,1036 +1,23 @@
 from tkinter import Tk, Menu, ttk, filedialog, messagebox, StringVar
 from pathlib import Path
-from typing import Optional, Any, List, Tuple, Callable
+from typing import Optional, Any, List, Tuple
 import queue
 import threading
-from dataclasses import dataclass
-import json
-import urllib.request
 import time
 
 import numpy as np
 from PIL import Image, ImageTk
-from annoy import AnnoyIndex
-from huggingface_hub import hf_hub_download
-import onnxruntime as ort
 
-DATASET_DIR = Path(__file__).with_name("celebrity_dataset")
-SAMPLE_CELEBRITY_URLS = {
-    "zendaya": "https://upload.wikimedia.org/wikipedia/commons/0/0d/Zendaya_2019_by_Glenn_Francis.jpg",
-    "ryan_gosling": "https://upload.wikimedia.org/wikipedia/commons/4/46/Ryan_gosling_cannes_2014.jpg",
-    "emma_watson": "https://upload.wikimedia.org/wikipedia/commons/1/1b/Emma_Watson_2013.jpg",
-    "michael_b_jordan": "https://upload.wikimedia.org/wikipedia/commons/5/5d/Michael_B._Jordan_in_2018.jpg",
-    "scarlett_johansson": "https://upload.wikimedia.org/wikipedia/commons/9/90/Scarlett_Johansson_by_Gage_Skidmore_2.jpg",
-}
-
-SAMPLE_CELEBRITY_GENDERS = {
-    "zendaya": "female",
-    "ryan_gosling": "male",
-    "emma_watson": "female",
-    "michael_b_jordan": "male",
-    "scarlett_johansson": "female",
-}
-
-
-def format_display_name(raw: str) -> str:
-    return raw.replace("_", " ").title()
-
-
-@dataclass
-class CelebrityEntry:
-    name: str
-    image: Image.Image
-    embedding: np.ndarray
-    path: Path
-    thumbnail: Image.Image
-    gender: str = "unknown"
-    gender_confidence: float = 0.0
-
-
-class FaceDetector:
-    MODEL_REPO = "onnx-community/face-detection-yunet"
-    MODEL_SUBFOLDER: Optional[str] = None
-    MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
-
-    def __init__(self, model_dir: Optional[Path] = None, score_threshold: float = 0.6) -> None:
-        try:
-            import cv2  # type: ignore
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "opencv-contrib-python is required for face detection. Install it via "
-                "'pip install opencv-contrib-python'."
-            ) from exc
-
-        self.cv2 = cv2
-        if not hasattr(cv2, "FaceDetectorYN_create"):
-            raise RuntimeError(
-                "Your OpenCV build does not include FaceDetectorYN. Install "
-                "'opencv-contrib-python>=4.8' and ensure it is the importable OpenCV."
-            )
-        if model_dir is None:
-            model_dir = Path(__file__).with_name("models")
-        self.model_dir = model_dir
-        self.model_dir.mkdir(parents=True, exist_ok=True)
-        manual_path = self.model_dir / self.MODEL_FILENAME
-        if manual_path.exists():
-            self.model_path = manual_path
-        else:
-            try:
-                resolved_path = hf_hub_download(
-                    repo_id=self.MODEL_REPO,
-                    filename=self.MODEL_FILENAME,
-                    subfolder=self.MODEL_SUBFOLDER,
-                    cache_dir=str(self.model_dir),
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Unable to download YuNet model automatically. "
-                    "Download 'face_detection_yunet_2023mar.onnx' manually (for example from "
-                    "https://huggingface.co/onnx-community/face-detection-yunet) and place it in the 'models/' folder."
-                ) from exc
-            self.model_path = Path(resolved_path)
-
-        if self.model_path.stat().st_size < 1024 * 100:
-            raise RuntimeError(
-                "YuNet model appears to be invalid (file is unexpectedly small). "
-                f"Remove {self.model_path} and download the ONNX manually (e.g. from "
-                "https://huggingface.co/onnx-community/face-detection-yunet)."
-            )
-
-        try:
-            self._detector = cv2.FaceDetectorYN_create(
-                str(self.model_path),
-                "",
-                (0, 0),
-                score_threshold,
-                0.3,
-                5000,
-            )
-        except cv2.error as exc:
-            raise RuntimeError(
-                "OpenCV failed to load the YuNet ONNX model. Ensure "
-                "'opencv-contrib-python>=4.8' is installed and that the model file "
-                "is valid (approx. 4.8 MB). Delete "
-                f"{self.model_path} and download it manually from https://huggingface.co/onnx-community/face-detection-yunet."
-            ) from exc
-
-    def detect(self, frame_rgb: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        if frame_rgb is None or frame_rgb.size == 0:
-            return []
-
-        height, width = frame_rgb.shape[:2]
-        if height == 0 or width == 0:
-            return []
-
-        frame_bgr = self.cv2.cvtColor(frame_rgb, self.cv2.COLOR_RGB2BGR)
-        self._detector.setInputSize((width, height))
-        success, faces = self._detector.detect(frame_bgr)
-        boxes: List[Tuple[int, int, int, int]] = []
-        if not success or faces is None:
-            return boxes
-
-        for face in faces:
-            x, y, w, h = face[:4]
-            x1 = max(int(x), 0)
-            y1 = max(int(y), 0)
-            w = int(w)
-            h = int(h)
-            if w <= 0 or h <= 0:
-                continue
-            x1 = min(x1, width - 1)
-            y1 = min(y1, height - 1)
-            w = min(w, width - x1)
-            h = min(h, height - y1)
-            boxes.append((x1, y1, w, h))
-        return boxes
-
-    def close(self) -> None:
-        self._detector = None
-
-
-class FaceEmbedder:
-    MODEL_REPO = "onnx-community/arcface-resnet100"
-    DEFAULT_FILENAME = "arcfaceresnet100-8.onnx"
-    PREFERRED_LOCAL_FILES = [
-        "arcfaceresnet100-11-int8.onnx",
-        "arcfaceresnet100-8.onnx",
-    ]
-
-    def __init__(self, model_dir: Optional[Path] = None) -> None:
-        models_dir = model_dir or Path(__file__).with_name("models")
-        models_dir.mkdir(parents=True, exist_ok=True)
-
-        manual_path: Optional[Path] = None
-        for filename in self.PREFERRED_LOCAL_FILES:
-            candidate = models_dir / filename
-            if candidate.exists():
-                manual_path = candidate
-                break
-
-        if manual_path is not None:
-            resolved_path = manual_path
-        else:
-            try:
-                resolved_path = Path(
-                    hf_hub_download(
-                        repo_id=self.MODEL_REPO,
-                        filename=self.DEFAULT_FILENAME,
-                        cache_dir=str(models_dir),
-                    )
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Unable to download ArcFace ONNX model. Download it manually from "
-                    "https://huggingface.co/onnx-community/arcface-resnet100 "
-                    "and place it in the 'models/' directory."
-                ) from exc
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        self.session = ort.InferenceSession(str(resolved_path), sess_options=options, providers=["CPUExecutionProvider"])
-        input_meta = self.session.get_inputs()[0]
-        self.input_name = input_meta.name
-        self.input_shape = input_meta.shape
-        self.input_height = int(self.input_shape[2]) if len(self.input_shape) > 2 and self.input_shape[2] is not None else 112
-        self.input_width = int(self.input_shape[3]) if len(self.input_shape) > 3 and self.input_shape[3] is not None else 112
-
-    def embed(self, face: np.ndarray | Image.Image) -> np.ndarray:
-        if isinstance(face, np.ndarray):
-            image = Image.fromarray(face.astype("uint8"))
-        else:
-            image = face
-
-        image = image.convert("RGB").resize((112, 112), Image.LANCZOS)
-        array = np.asarray(image, dtype=np.float32)
-        array = array[:, :, ::-1]  # RGB -> BGR
-        array = (array - 127.5) / 128.0
-        array = np.transpose(array, (2, 0, 1))
-        array = np.expand_dims(array, axis=0).astype(np.float32)
-
-        embedding = self.session.run(None, {self.input_name: array})[0][0]
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-        return embedding.astype(np.float32)
-
-    def warmup(self, runs: int = 1) -> None:
-        dummy = np.zeros((1, 3, self.input_height, self.input_width), dtype=np.float32)
-        for _ in range(max(0, runs)):
-            try:
-                self.session.run(None, {self.input_name: dummy})
-            except Exception:
-                break
-
-
-class GenderClassifier:
-    MODEL_REPO = "onnx-community/gender-classification"
-    MODEL_FILENAME = "gender_mobilev3_small_int8.onnx"
-    PREFERRED_LOCAL_FILES = [
-        "gender_mobilev3_small_int8.onnx",
-        "gender_mobilev3_small.onnx",
-        "gender_mobilenetv2_int8.onnx",
-        "model_int8.onnx",
-        "model.onnx",
-    ]
-    LABELS = ("female", "male")
-
-    def __init__(self, model_dir: Optional[Path] = None, model_path: Optional[Path] = None) -> None:
-        models_dir = model_dir or Path(__file__).with_name("models")
-        models_dir.mkdir(parents=True, exist_ok=True)
-
-        resolved_path: Optional[Path] = None
-        if model_path is not None:
-            candidate = Path(model_path)
-            if candidate.exists():
-                resolved_path = candidate
-            else:
-                raise FileNotFoundError(f"Specified gender classifier not found: {candidate}")
-
-        if resolved_path is None:
-            for candidate_name in self.PREFERRED_LOCAL_FILES:
-                candidate = models_dir / candidate_name
-                if candidate.exists():
-                    resolved_path = candidate
-                    break
-
-        if resolved_path is None:
-            fallback_candidates = sorted(
-                models_dir.glob("*gender*.onnx"),
-                key=lambda path: path.name.lower(),
-            )
-            if fallback_candidates:
-                resolved_path = fallback_candidates[0]
-
-        if resolved_path is None:
-            try:
-                resolved_path = Path(
-                    hf_hub_download(
-                        repo_id=self.MODEL_REPO,
-                        filename=self.MODEL_FILENAME,
-                        cache_dir=str(models_dir),
-                    )
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Unable to load gender classifier. Download a compact gender classification "
-                    "ONNX model (e.g. 'gender_mobilev3_small_int8.onnx') and place it inside the "
-                    "'models/' directory."
-                ) from exc
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        self.session = ort.InferenceSession(str(resolved_path), sess_options=options, providers=["CPUExecutionProvider"])
-
-        input_meta = self.session.get_inputs()[0]
-        self.input_name = input_meta.name
-        shape = input_meta.shape
-        # Default to 224 if the model uses dynamic dimensions.
-        default_size = 224
-        self.input_height = default_size
-        self.input_width = default_size
-        try:
-            if len(shape) >= 4:
-                if isinstance(shape[2], int) and shape[2] > 0:
-                    self.input_height = int(shape[2])
-                if isinstance(shape[3], int) and shape[3] > 0:
-                    self.input_width = int(shape[3])
-        except (TypeError, IndexError):
-            pass
-
-        output_meta = self.session.get_outputs()[0]
-        self.output_name = output_meta.name
-        self._rescale = 1.0 / 255.0
-        self._mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        self._std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        self._convert_to_rgb = True
-
-        # Read optional Hugging Face preprocessor config if available.
-        config_path = models_dir / "preprocessor_config.json"
-        if not config_path.exists():
-            alt_config = resolved_path.with_name("preprocessor_config.json")
-            if alt_config.exists():
-                config_path = alt_config
-        if config_path.exists():
-            try:
-                import json
-
-                with config_path.open("r", encoding="utf-8") as stream:
-                    config = json.load(stream)
-                size = config.get("size") or {}
-                height = size.get("height")
-                width = size.get("width")
-                if isinstance(height, int) and height > 0:
-                    self.input_height = height
-                if isinstance(width, int) and width > 0:
-                    self.input_width = width
-                if bool(config.get("do_rescale", True)):
-                    factor = config.get("rescale_factor")
-                    if isinstance(factor, (float, int)) and factor > 0:
-                        self._rescale = float(factor)
-                if bool(config.get("do_normalize", True)):
-                    mean = config.get("image_mean")
-                    std = config.get("image_std")
-                    if isinstance(mean, (list, tuple)) and len(mean) == 3:
-                        self._mean = np.array(mean, dtype=np.float32)
-                    if isinstance(std, (list, tuple)) and len(std) == 3:
-                        self._std = np.array(std, dtype=np.float32)
-                convert_rgb = config.get("do_convert_rgb")
-                if convert_rgb is False:
-                    self._convert_to_rgb = False
-            except Exception:
-                pass
-
-    def warmup(self, runs: int = 1) -> None:
-        dummy = np.zeros((1, 3, self.input_height, self.input_width), dtype=np.float32)
-        for _ in range(max(0, runs)):
-            try:
-                self.session.run([self.output_name], {self.input_name: dummy})
-            except Exception:
-                break
-
-    def classify(self, face: np.ndarray | Image.Image) -> Tuple[str, float, np.ndarray]:
-        tensor = self._prepare(face)
-        raw_output = self.session.run([self.output_name], {self.input_name: tensor})[0]
-        if raw_output.ndim == 2:
-            raw_output = raw_output[0]
-        probabilities = self._softmax(raw_output.astype(np.float32))
-        best_idx = int(np.argmax(probabilities))
-        label = self.LABELS[best_idx] if 0 <= best_idx < len(self.LABELS) else "unknown"
-        confidence = float(probabilities[best_idx]) if label != "unknown" else 0.0
-        return label, confidence, probabilities
-
-    def _prepare(self, face: np.ndarray | Image.Image) -> np.ndarray:
-        if isinstance(face, np.ndarray):
-            if self._convert_to_rgb:
-                image = Image.fromarray(face.astype("uint8"), mode="RGB")
-            else:
-                image = Image.fromarray(face.astype("uint8"))
-        else:
-            image = face
-
-        if self._convert_to_rgb:
-            image = image.convert("RGB")
-        resized = image.resize((self.input_width, self.input_height), Image.LANCZOS)
-        array = np.asarray(resized, dtype=np.float32)
-        if self._rescale != 1.0:
-            array = array * self._rescale
-        array = (array - self._mean) / self._std
-        array = np.transpose(array, (2, 0, 1))
-        array = np.expand_dims(array, axis=0).astype(np.float32)
-        return array
-
-    def _softmax(self, logits: np.ndarray) -> np.ndarray:
-        logits = logits - np.max(logits)
-        exp = np.exp(logits)
-        total = np.sum(exp)
-        if total <= 0:
-            return np.full(len(self.LABELS), 0.5, dtype=np.float32)
-        return (exp / total).astype(np.float32)
-
-
-class GenderSmoother:
-    LABELS = ("female", "male")
-
-    def __init__(self, alpha: float = 0.65, min_confidence: float = 0.55) -> None:
-        self.alpha = alpha
-        self.min_confidence = min_confidence
-        self._probabilities: Optional[np.ndarray] = None
-
-    def reset(self) -> None:
-        self._probabilities = None
-
-    def update(self, probabilities: Optional[np.ndarray]) -> Tuple[str, float]:
-        if probabilities is None:
-            self.reset()
-            return "unknown", 0.0
-
-        probs = np.asarray(probabilities, dtype=np.float32)
-        if probs.ndim == 2:
-            probs = probs[0]
-        if probs.shape[0] != len(self.LABELS):
-            return "unknown", 0.0
-
-        probs_sum = float(np.sum(probs))
-        probs = probs / probs_sum if probs_sum > 0 else np.full_like(probs, 1.0 / len(self.LABELS))
-
-        if self._probabilities is None:
-            self._probabilities = probs
-        else:
-            self._probabilities = self.alpha * probs + (1.0 - self.alpha) * self._probabilities
-
-        best_idx = int(np.argmax(self._probabilities))
-        label = self.LABELS[best_idx]
-        confidence = float(self._probabilities[best_idx])
-        if confidence < self.min_confidence:
-            return "unknown", confidence
-        return label, confidence
-
-
-def extract_face_region(
-    source: Image.Image,
-    face_detector: Optional[FaceDetector],
-) -> Image.Image:
-    """Return the largest detected face region, or a centered crop if detection fails."""
-    if face_detector is None:
-        return _center_square_crop(source)
-
-    array = np.array(source.convert("RGB"))
-    boxes = face_detector.detect(array)
-    if not boxes:
-        return _center_square_crop(source)
-
-    x, y, w, h = max(boxes, key=lambda rect: rect[2] * rect[3])
-    return source.crop((x, y, x + w, y + h))
-
-
-def _center_square_crop(image: Image.Image) -> Image.Image:
-    width, height = image.size
-    side = min(width, height)
-    left = (width - side) // 2
-    top = (height - side) // 2
-    return image.crop((left, top, left + side, top + side))
-
-
-class CelebrityDataset:
-    def __init__(self, dataset_dir: Path, url_map: dict[str, str]) -> None:
-        self.CACHE_VERSION = 3
-        self.dataset_dir = dataset_dir
-        self.url_map = url_map
-        self.entries: List[CelebrityEntry] = []
-        self.embedding_matrix: Optional[np.ndarray] = None
-        self.annoy_index: Optional[AnnoyIndex] = None
-        self.gender_indices: dict[str, List[int]] = {"male": [], "female": [], "unknown": []}
-        self.gender_centroids: dict[str, np.ndarray] = {}
-        self.status_callback: Optional[Callable[[Optional[str], Optional[float]], None]] = None
-        self.gender_classifier: Optional[GenderClassifier] = None
-        self._dataset_signature: Optional[Tuple[Tuple[str, int, int], ...]] = None
-        self._metadata_mtime_ns: Optional[int] = None
-        self.cache_dir = self.dataset_dir / ".cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_manifest_path = self.cache_dir / "manifest.json"
-        self._cache_embedding_path = self.cache_dir / "embedding_matrix.npy"
-        self._cache_annoy_path = self.cache_dir / "index.ann"
-        self._load_thread: Optional[threading.Thread] = None
-        self._load_thread_lock = threading.Lock()
-        self._load_event = threading.Event()
-        self._load_event.set()
-
-    def ensure_directory(self) -> None:
-        self.dataset_dir.mkdir(parents=True, exist_ok=True)
-
-    def set_status_callback(self, callback: Optional[Callable[[Optional[str], Optional[float]], None]]) -> None:
-        self.status_callback = callback
-
-    def set_gender_classifier(self, classifier: Optional[GenderClassifier]) -> None:
-        self.gender_classifier = classifier
-
-    def _notify_status(self, message: Optional[str], progress: Optional[float]) -> None:
-        if self.status_callback is not None:
-            try:
-                self.status_callback(message, progress)
-            except Exception:
-                pass
-
-    def _compute_signature(self) -> Tuple[Tuple[Tuple[str, int, int], ...], Optional[int]]:
-        files = self.available_files()
-        file_records: List[Tuple[str, int, int]] = []
-        for path in files:
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            file_records.append((str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)))
-        file_records_tuple = tuple(sorted(file_records))
-        metadata_path = self.dataset_dir / "metadata.json"
-        metadata_mtime = None
-        if metadata_path.exists():
-            try:
-                metadata_mtime = int(metadata_path.stat().st_mtime_ns)
-            except OSError:
-                metadata_mtime = None
-        return file_records_tuple, metadata_mtime
-
-    def _load_cache_manifest(self) -> dict:
-        if not self._cache_manifest_path.exists():
-            return {}
-        try:
-            return json.loads(self._cache_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _save_cache_manifest(self, manifest: dict) -> None:
-        try:
-            self._cache_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    def _cache_name(self, slug: str, suffix: str) -> str:
-        return f"{slug}{suffix}"
-
-    def _cache_path(self, slug: str, suffix: str) -> Path:
-        return self.cache_dir / self._cache_name(slug, suffix)
-
-    def _load_from_cache_manifest(
-        self,
-        manifest: dict,
-        signature_files: Tuple[Tuple[str, int, int], ...],
-        metadata_mtime: Optional[int],
-    ) -> bool:
-        if (
-            manifest.get("signature") != list(signature_files)
-            or manifest.get("metadata_mtime") != metadata_mtime
-            or manifest.get("cache_version") != self.CACHE_VERSION
-        ):
-            return False
-        embedding_file = manifest.get("embedding_matrix")
-        index_file = manifest.get("annoy_index")
-        if not embedding_file or not index_file:
-            return False
-        embedding_path = self.cache_dir / embedding_file
-        index_path = self.cache_dir / index_file
-        if not embedding_path.exists() or not index_path.exists():
-            return False
-        order: List[str] = manifest.get("order") or []
-        images_meta: dict = manifest.get("images") or {}
-        try:
-            embedding_matrix = np.load(embedding_path)
-        except Exception:
-            return False
-        if not order or embedding_matrix.shape[0] != len(order):
-            return False
-        dim = embedding_matrix.shape[1]
-        index = AnnoyIndex(dim, "angular")
-        try:
-            index.load(str(index_path))
-        except Exception:
-            return False
-
-        new_entries: List[CelebrityEntry] = []
-        embeddings: List[np.ndarray] = []
-
-        for idx, slug in enumerate(order):
-            meta = images_meta.get(slug)
-            if not meta:
-                return False
-            path = Path(meta.get("path", ""))
-            if not path.exists():
-                return False
-            try:
-                with Image.open(path) as img:
-                    rgb_image = img.convert("RGB")
-            except Exception:
-                return False
-
-            thumbnail_name = meta.get("thumbnail")
-            if thumbnail_name:
-                thumb_path = self.cache_dir / thumbnail_name
-            else:
-                thumb_path = None
-            thumbnail_image: Optional[Image.Image] = None
-            if thumb_path and thumb_path.exists():
-                try:
-                    with Image.open(thumb_path) as thumb_img:
-                        thumbnail_image = thumb_img.convert("RGB")
-                except Exception:
-                    thumbnail_image = None
-            if thumbnail_image is None:
-                thumbnail_image = rgb_image.copy()
-                thumbnail_image.thumbnail((360, 270), Image.LANCZOS)
-
-            embedding = embedding_matrix[idx]
-            embeddings.append(embedding)
-            entry = CelebrityEntry(
-                name=meta.get("name", slug),
-                image=rgb_image.copy(),
-                embedding=embedding.astype(np.float32),
-                path=path,
-                thumbnail=thumbnail_image.copy(),
-                gender=meta.get("gender", "unknown"),
-                gender_confidence=float(meta.get("gender_confidence", 0.0)),
-            )
-            new_entries.append(entry)
-
-        self.entries = new_entries
-        self.embedding_matrix = embedding_matrix.astype(np.float32)
-        self.annoy_index = index
-        self.gender_indices = {"male": [], "female": [], "unknown": []}
-        for idx, entry in enumerate(self.entries):
-            self.gender_indices.setdefault(entry.gender, []).append(idx)
-
-        self.gender_centroids = {}
-        if self.embedding_matrix is not None:
-            for gender in ("male", "female"):
-                idxs = [i for i, entry in enumerate(self.entries) if entry.gender == gender]
-                if not idxs:
-                    continue
-                centroid = self.embedding_matrix[idxs].mean(axis=0)
-                norm = np.linalg.norm(centroid)
-                if norm > 0:
-                    centroid = centroid / norm
-                self.gender_centroids[gender] = centroid.astype(np.float32)
-
-        self._dataset_signature = signature_files
-        self._metadata_mtime_ns = metadata_mtime
-        self._notify_status(None, 1.0)
-        self._load_event.set()
-        return True
-
-    def _load_metadata(self) -> dict:
-        metadata_path = self.dataset_dir / "metadata.json"
-        if not metadata_path.exists():
-            return {}
-        try:
-            return json.loads(metadata_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
-
-    def download_samples(self) -> Tuple[int, List[str]]:
-        """
-        Download a curated set of celebrity portraits. Returns count of saved files and failures.
-        """
-        self.ensure_directory()
-        saved = 0
-        failures: List[str] = []
-
-        for name, url in self.url_map.items():
-            target = self.dataset_dir / f"{name}.png"
-            if target.exists():
-                continue
-            try:
-                with urllib.request.urlopen(url, timeout=30) as response:
-                    data = response.read()
-                target.write_bytes(data)
-                saved += 1
-            except Exception:
-                failures.append(name)
-
-        if saved > 0:
-            self.entries.clear()
-        return saved, failures
-
-    def available_files(self) -> List[Path]:
-        self.ensure_directory()
-        patterns = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
-        files: List[Path] = []
-        for pattern in patterns:
-            files.extend(sorted(self.dataset_dir.glob(pattern)))
-        return files
-
-    def load_entries(
-        self,
-        face_detector: Optional[FaceDetector],
-        face_embedder: FaceEmbedder,
-        gender_classifier: Optional[GenderClassifier] = None,
-    ) -> None:
-        signature_files, metadata_mtime = self._compute_signature()
-        manifest = self._load_cache_manifest()
-        if self._load_from_cache_manifest(manifest, signature_files, metadata_mtime):
-            return
-
-        self._load_event.clear()
-        try:
-            files = self.available_files()
-            entries: List[CelebrityEntry] = []
-            embeddings: List[np.ndarray] = []
-            total = len(files)
-
-            metadata = self._load_metadata()
-            self.gender_indices = {"male": [], "female": [], "unknown": []}
-
-            if total == 0:
-                self.entries = []
-                self.embedding_matrix = None
-                self._notify_status("No celebrity images found.", None)
-                return
-
-            self._notify_status(f"Loading celebrity images 0/{total}", 0.0)
-
-            classifier = gender_classifier or self.gender_classifier
-            manifest_images: dict = manifest.get("images", {}) if manifest else {}
-            updated_manifest_images: dict = {}
-            order: List[str] = []
-
-            for path in files:
-                try:
-                    with Image.open(path) as img:
-                        rgb_image = img.convert("RGB")
-                except OSError:
-                    continue
-
-                slug = path.stem
-                stat = path.stat()
-                cache_entry = manifest_images.get(slug) if manifest_images else None
-                use_cache = (
-                    cache_entry is not None
-                    and cache_entry.get("size") == int(stat.st_size)
-                    and cache_entry.get("mtime_ns") == int(stat.st_mtime_ns)
-                )
-
-                face_image: Optional[Image.Image] = None
-                embedding: Optional[np.ndarray] = None
-                thumbnail: Optional[Image.Image] = None
-                cached_gender = "unknown"
-                cached_gender_confidence = 0.0
-
-                if use_cache:
-                    embedding_name = cache_entry.get("embedding")
-                    if embedding_name:
-                        embedding_path = self.cache_dir / embedding_name
-                        if embedding_path.exists():
-                            try:
-                                embedding = np.load(embedding_path).astype(np.float32)
-                            except Exception:
-                                embedding = None
-                    face_crop_name = cache_entry.get("face_crop")
-                    if face_crop_name:
-                        face_crop_path = self.cache_dir / face_crop_name
-                        if face_crop_path.exists():
-                            try:
-                                with Image.open(face_crop_path) as face_img:
-                                    face_image = face_img.convert("RGB")
-                            except Exception:
-                                face_image = None
-                    thumbnail_name = cache_entry.get("thumbnail")
-                    if thumbnail_name:
-                        thumb_path = self.cache_dir / thumbnail_name
-                        if thumb_path.exists():
-                            try:
-                                with Image.open(thumb_path) as thumb_img:
-                                    thumbnail = thumb_img.convert("RGB")
-                            except Exception:
-                                thumbnail = None
-                    cached_gender = cache_entry.get("gender", "unknown")
-                    cached_gender_confidence = float(cache_entry.get("gender_confidence", 0.0))
-
-                if embedding is None:
-                    if face_image is None:
-                        face_image = extract_face_region(rgb_image, face_detector)
-                    embedding = face_embedder.embed(np.array(face_image))
-
-                if thumbnail is None:
-                    thumbnail = rgb_image.copy()
-                    thumbnail.thumbnail((360, 270), Image.LANCZOS)
-
-                meta_entry = metadata.get(slug, {})
-                gender_source = meta_entry.get("gender") or SAMPLE_CELEBRITY_GENDERS.get(slug, cached_gender)
-                gender = (gender_source or "unknown").lower()
-                if gender not in ("male", "female"):
-                    gender = "unknown"
-
-                predicted_gender = "unknown"
-                predicted_confidence = 0.0
-                if gender == "unknown" and cached_gender in ("male", "female"):
-                    predicted_gender = cached_gender
-                    predicted_confidence = cached_gender_confidence
-                if classifier is not None and face_image is not None and gender == "unknown":
-                    try:
-                        predicted_gender, predicted_confidence, _ = classifier.classify(face_image)
-                    except Exception:
-                        predicted_gender = "unknown"
-                        predicted_confidence = 0.0
-
-                if gender == "unknown" and predicted_gender in ("male", "female"):
-                    gender = predicted_gender
-
-                if meta_entry.get("gender") in ("male", "female"):
-                    gender_confidence = 1.0
-                elif gender == predicted_gender:
-                    gender_confidence = predicted_confidence
-                else:
-                    gender_confidence = cached_gender_confidence if use_cache else 0.0
-
-                entry = CelebrityEntry(
-                    name=meta_entry.get("name", slug),
-                    image=rgb_image.copy(),
-                    embedding=embedding,
-                    path=path,
-                    thumbnail=thumbnail.copy(),
-                    gender=gender,
-                    gender_confidence=gender_confidence,
-                )
-                entries.append(entry)
-                embeddings.append(embedding)
-                order.append(slug)
-
-                face_crop_name = cache_entry.get("face_crop") if use_cache else None
-                face_crop_default = self._cache_name(slug, "_face.png")
-                face_crop_path = self.cache_dir / (face_crop_name or face_crop_default)
-                if face_image is not None and (not face_crop_path.exists() or not use_cache):
-                    try:
-                        face_image.save(face_crop_path, format="PNG")
-                    except Exception:
-                        pass
-                    face_crop_name = face_crop_path.name
-                elif face_crop_path.exists():
-                    face_crop_name = face_crop_path.name
-                else:
-                    face_crop_name = face_crop_default
-
-                thumbnail_name = self._cache_name(slug, "_thumbnail.jpg")
-                thumbnail_path = self.cache_dir / thumbnail_name
-                if not thumbnail_path.exists() or not use_cache:
-                    try:
-                        thumbnail.convert("RGB").save(thumbnail_path, format="JPEG", quality=90)
-                    except Exception:
-                        pass
-
-                embedding_name = cache_entry.get("embedding") if use_cache else None
-                embedding_path = self.cache_dir / (embedding_name or self._cache_name(slug, "_embedding.npy"))
-                if not embedding_path.exists() or not use_cache:
-                    try:
-                        np.save(embedding_path, embedding.astype(np.float32))
-                    except Exception:
-                        pass
-                    embedding_name = embedding_path.name
-                else:
-                    embedding_name = embedding_path.name
-
-                updated_manifest_images[slug] = {
-                    "path": str(path),
-                    "size": int(stat.st_size),
-                    "mtime_ns": int(stat.st_mtime_ns),
-                    "name": meta_entry.get("name", slug),
-                    "gender": gender,
-                    "gender_confidence": gender_confidence,
-                    "thumbnail": thumbnail_path.name,
-                    "face_crop": face_crop_name,
-                    "embedding": embedding_name,
-                }
-
-                if total:
-                    progress = len(entries) / total
-                    self._notify_status(f"Loading celebrity images {len(entries)}/{total}", progress)
-
-            self.entries = entries
-            if embeddings:
-                self.embedding_matrix = np.vstack(embeddings)
-                dim = embeddings[0].shape[0]
-                index = AnnoyIndex(dim, "angular")
-                for idx, emb in enumerate(embeddings):
-                    index.add_item(idx, emb.tolist())
-                index.build(10)
-                self.annoy_index = index
-                try:
-                    np.save(self._cache_embedding_path, self.embedding_matrix.astype(np.float32))
-                except Exception:
-                    pass
-                try:
-                    index.save(str(self._cache_annoy_path))
-                except Exception:
-                    pass
-            else:
-                self.embedding_matrix = None
-                self.annoy_index = None
-
-            for idx, entry in enumerate(self.entries):
-                self.gender_indices.setdefault(entry.gender, []).append(idx)
-            if total:
-                self._notify_status(None, 1.0)
-
-            self.gender_centroids = {}
-            if self.embedding_matrix is not None:
-                for gender in ("male", "female"):
-                    idxs = [i for i, entry in enumerate(self.entries) if entry.gender == gender]
-                    if not idxs:
-                        continue
-                    centroid = self.embedding_matrix[idxs].mean(axis=0)
-                    norm = np.linalg.norm(centroid)
-                    if norm > 0:
-                        centroid = centroid / norm
-                    self.gender_centroids[gender] = centroid.astype(np.float32)
-
-            self._dataset_signature = signature_files
-            self._metadata_mtime_ns = metadata_mtime
-            manifest_update = {
-                "signature": list(signature_files),
-                "metadata_mtime": metadata_mtime,
-                "cache_version": self.CACHE_VERSION,
-                "images": updated_manifest_images,
-                "order": order,
-                "embedding_matrix": self._cache_embedding_path.name,
-                "annoy_index": self._cache_annoy_path.name,
-            }
-            self._save_cache_manifest(manifest_update)
-        finally:
-            self._load_event.set()
-
-    def prefetch_entries(
-        self,
-        face_detector: Optional[FaceDetector],
-        face_embedder: FaceEmbedder,
-        gender_classifier: Optional[GenderClassifier] = None,
-        *,
-        force: bool = False,
-    ) -> None:
-        with self._load_thread_lock:
-            if self._load_thread is not None and self._load_thread.is_alive():
-                return
-            if (
-                not force
-                and self.entries
-                and self._dataset_signature is not None
-                and self._metadata_mtime_ns is not None
-                and self._load_event.is_set()
-            ):
-                return
-
-            self._load_event.clear()
-            def worker() -> None:
-                try:
-                    self.load_entries(face_detector, face_embedder, gender_classifier)
-                except Exception:
-                    pass
-                finally:
-                    with self._load_thread_lock:
-                        self._load_thread = None
-
-            self._load_thread = threading.Thread(target=worker, daemon=True)
-            self._load_thread.start()
-
-    def require_entries(
-        self,
-        face_detector: Optional[FaceDetector],
-        face_embedder: FaceEmbedder,
-        gender_classifier: Optional[GenderClassifier] = None,
-        *,
-        wait: bool = True,
-    ) -> None:
-        current_signature, current_metadata = self._compute_signature()
-        dataset_changed = (
-            self._dataset_signature is None
-            or self._dataset_signature != current_signature
-            or self._metadata_mtime_ns != current_metadata
-        )
-
-        if dataset_changed:
-            self._notify_status("Dataset change detected; refreshing faces…", 0.0)
-            self.prefetch_entries(face_detector, face_embedder, gender_classifier, force=True)
-        elif not self.entries:
-            self.prefetch_entries(face_detector, face_embedder, gender_classifier, force=True)
-
-        if wait:
-            self._load_event.wait()
-
-        if not self.entries:
-            raise FileNotFoundError(
-                "No celebrity images were found. Add images to the dataset or download the curated set."
-            )
-
-    def best_match(
-        self,
-        source_image: Image.Image,
-        face_detector: Optional[FaceDetector],
-        face_embedder: FaceEmbedder,
-        allowed_genders: Optional[List[str]] = None,
-        gender_classifier: Optional[GenderClassifier] = None,
-    ) -> Tuple[CelebrityEntry, float]:
-        self.require_entries(face_detector, face_embedder, gender_classifier)
-
-        face = extract_face_region(source_image, face_detector)
-        embedding = face_embedder.embed(np.array(face))
-        return self.best_match_from_embedding(embedding, allowed_genders)
-
-    def best_match_from_embedding(
-        self,
-        embedding: np.ndarray,
-        allowed_genders: Optional[List[str]] = None,
-    ) -> Tuple[CelebrityEntry, float]:
-        if not self.entries or self.annoy_index is None or self.embedding_matrix is None:
-            raise FileNotFoundError(
-                "No celebrity images were found. Add images to the dataset or download the curated set."
-            )
-
-        top_n = min(50, len(self.entries))
-        candidate_ids = self.annoy_index.get_nns_by_vector(embedding.tolist(), top_n, include_distances=False)
-        best_idx: Optional[int] = None
-
-        if allowed_genders:
-            for idx in candidate_ids:
-                if self.entries[idx].gender in allowed_genders:
-                    best_idx = idx
-                    break
-
-        if best_idx is None:
-            best_idx = candidate_ids[0] if candidate_ids else 0
-
-        similarity = float(np.dot(embedding, self.embedding_matrix[best_idx]))
-        return self.entries[best_idx], similarity
-
-    def infer_gender(self, embedding: np.ndarray) -> str:
-        if not self.gender_centroids:
-            return "unknown"
-
-        best_gender = "unknown"
-        best_score = -1.0
-        for gender, centroid in self.gender_centroids.items():
-            score = float(np.dot(embedding, centroid))
-            if score > best_score:
-                best_score = score
-                best_gender = gender
-
-        if best_score < 0.25:
-            return "unknown"
-        return best_gender
+from face_detection import FaceDetector, extract_face_region
+from gender import GenderClassifier, GenderSmoother
+from matcher import (
+    CelebrityDataset,
+    CelebrityEntry,
+    FaceEmbedder,
+    DATASET_DIR,
+    SAMPLE_CELEBRITY_URLS,
+    format_display_name,
+)
 
 
 class CelebrityMatcherApp:
@@ -1066,9 +53,10 @@ class CelebrityMatcherApp:
         self.latest_face_array: Optional[np.ndarray] = None
         self.current_face_gender: str = "unknown"
         self.current_gender_confidence: float = 0.0
-        self.is_frozen = False
-        self.frozen_frame: Optional[np.ndarray] = None
-        self.freeze_button: Optional[ttk.Button] = None
+        self.capture_button: Optional[ttk.Button] = None
+        self.load_photo_button: Optional[ttk.Button] = None
+        self.use_camera_button: Optional[ttk.Button] = None
+        self.stop_camera_button: Optional[ttk.Button] = None
         self.dataset_status_label: Optional[ttk.Label] = None
         self.dataset_progress: Optional[ttk.Progressbar] = None
         self.freeze_status_label: Optional[ttk.Label] = None
@@ -1078,6 +66,7 @@ class CelebrityMatcherApp:
         self.gender_classifier_warning: Optional[str] = None
         self.gender_smoother = GenderSmoother()
         self.last_sent_frame_time: float = 0.0
+        self.snapshot_photo: Optional[ImageTk.PhotoImage] = None
 
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.face_detector = FaceDetector(self.model_dir)
@@ -1120,6 +109,35 @@ class CelebrityMatcherApp:
         if self.freeze_status_label is not None:
             self.freeze_status_label.config(text=f"Mode: {mode}", foreground=color)
 
+    def _set_button_state(self, button: Optional[ttk.Button], enabled: bool) -> None:
+        if button is None:
+            return
+        if enabled:
+            button.state(["!disabled"])
+        else:
+            button.state(["disabled"])
+
+    def _disable_controls_for_snapshot(self) -> None:
+        for button in (self.load_photo_button, self.use_camera_button, self.stop_camera_button, self.capture_button):
+            self._set_button_state(button, False)
+
+    def _restore_controls_after_snapshot(self) -> None:
+        self._set_button_state(self.load_photo_button, True)
+        self._set_button_state(self.use_camera_button, True)
+        self._set_button_state(self.stop_camera_button, False)
+        self._set_button_state(self.capture_button, False)
+
+    def _show_captured_frame(self, frame_array: np.ndarray) -> None:
+        try:
+            captured_image = Image.fromarray(frame_array.astype("uint8"))
+        except Exception:
+            return
+        preview = captured_image.resize((360, 270))
+        self.snapshot_photo = ImageTk.PhotoImage(preview)
+        self.camera_photo = self.snapshot_photo
+        self.camera_label.config(image=self.snapshot_photo, text="Captured photo")
+        self.image_status.config(text="Captured photo ready.")
+
     def _bucket_similarity(self, score: float) -> str:
         if score >= 0.85:
             return "high"
@@ -1129,14 +147,19 @@ class CelebrityMatcherApp:
             return "low"
         return "very low"
 
-    def _format_similarity(self, cosine_similarity: Optional[float]) -> str:
+    def _format_similarity(self, cosine_similarity: Optional[float], percentile: Optional[float] = None) -> str:
         if cosine_similarity is None:
             return "Similarity: --"
         clamped = max(-1.0, min(float(cosine_similarity), 1.0))
         normalized = (clamped + 1.0) / 2.0
         normalized = max(0.0, min(normalized, 1.0))
         bucket = self._bucket_similarity(normalized)
-        return f"Similarity: {normalized * 100:.1f}% ({bucket})"
+        detail = f"Similarity: {normalized * 100:.1f}% ({bucket}"
+        if percentile is not None:
+            percentile = max(0.0, min(float(percentile), 1.0))
+            detail += f", top {percentile * 100:.1f}%"
+        detail += ")"
+        return detail
 
     def _update_gender_status(self, gender: str, confidence: float) -> None:
         resolved_gender = gender if gender in ("male", "female") else "unknown"
@@ -1212,17 +235,18 @@ class CelebrityMatcherApp:
         for col in range(4):
             controls.columnconfigure(col, weight=1)
 
-        ttk.Button(controls, text="Load Photo", command=self.load_image).grid(
-            column=0, row=0, padx=(0, 8), sticky="ew"
-        )
-        ttk.Button(controls, text="Use Camera", command=self.capture_from_camera).grid(
-            column=1, row=0, padx=4, sticky="ew"
-        )
-        ttk.Button(controls, text="Stop Camera", command=self.stop_camera).grid(
-            column=2, row=0, padx=(8, 0), sticky="ew"
-        )
-        self.freeze_button = ttk.Button(controls, text="Freeze Frame", command=self.toggle_freeze)
-        self.freeze_button.grid(column=3, row=0, padx=(8, 0), sticky="ew")
+        self.load_photo_button = ttk.Button(controls, text="Load Photo", command=self.load_image)
+        self.load_photo_button.grid(column=0, row=0, padx=(0, 8), sticky="ew")
+        self.use_camera_button = ttk.Button(controls, text="Use Camera", command=self.capture_from_camera)
+        self.use_camera_button.grid(column=1, row=0, padx=4, sticky="ew")
+        self.stop_camera_button = ttk.Button(controls, text="Stop Camera", command=self.stop_camera)
+        self.stop_camera_button.grid(column=2, row=0, padx=(8, 0), sticky="ew")
+        self.capture_button = ttk.Button(controls, text="Capture Photo", command=self.capture_snapshot)
+        self.capture_button.grid(column=3, row=0, padx=(8, 0), sticky="ew")
+        if self.stop_camera_button is not None:
+            self.stop_camera_button.state(["disabled"])
+        if self.capture_button is not None:
+            self.capture_button.state(["disabled"])
         ttk.Label(controls, text="Camera Index").grid(column=0, row=1, pady=(8, 0), sticky="w")
         self.camera_index_combo = ttk.Combobox(
             controls,
@@ -1283,7 +307,7 @@ class CelebrityMatcherApp:
             return
 
         try:
-            match_entry, similarity = self.match_celebrity(source_image)
+            match_entry, similarity, percentile = self.match_celebrity(source_image)
         except FileNotFoundError as exc:
             self.match_result.config(text=str(exc))
             return
@@ -1291,7 +315,7 @@ class CelebrityMatcherApp:
             self.match_result.config(text="Failed to compute a match for this image.")
             return
 
-        self._apply_match_entry(match_entry, similarity)
+        self._apply_match_entry(match_entry, similarity, percentile)
         self.gender_smoother.reset()
         predicted_gender = match_entry.gender
         predicted_confidence = match_entry.gender_confidence
@@ -1360,6 +384,9 @@ class CelebrityMatcherApp:
         self._update_freeze_status("Live", "green")
         self._start_live_matching()
         self._update_camera_frame()
+        self._set_button_state(self.use_camera_button, False)
+        self._set_button_state(self.stop_camera_button, True)
+        self._set_button_state(self.capture_button, True)
 
     def download_celebrity_set(self) -> None:
         saved, failures = self.dataset.download_samples()
@@ -1401,15 +428,14 @@ class CelebrityMatcherApp:
         self.last_sent_frame_time = 0.0
         self.current_face_gender = "unknown"
         self.current_gender_confidence = 0.0
-        self.is_frozen = False
-        self.frozen_frame = None
-        if self.freeze_button is not None:
-            self.freeze_button.config(text="Freeze Frame")
         self.camera_label.config(text="Camera preview stopped.", image="")
         self.image_status.config(text="Camera stopped. Select a photo or restart the camera.")
         self._update_gender_status("unknown", 0.0)
         if self.similarity_label is not None:
             self.similarity_label.config(text="Similarity: --")
+        self._set_button_state(self.capture_button, False)
+        self._set_button_state(self.stop_camera_button, False)
+        self._set_button_state(self.use_camera_button, True)
         self._update_freeze_status("Stopped", "grey")
 
     def _detect_cameras(self, max_devices: int = 6) -> List[int]:
@@ -1502,7 +528,7 @@ class CelebrityMatcherApp:
 
         self.camera_photo = ImageTk.PhotoImage(preview_image)
         self.camera_label.config(image=self.camera_photo, text="")
-        if not self.is_frozen:
+        if self.camera_running:
             self.root.after(30, self._update_camera_frame)
 
     def _handle_no_face_detected(self) -> None:
@@ -1567,9 +593,15 @@ class CelebrityMatcherApp:
     def _drain_match_results(self) -> None:
         while True:
             try:
-                digest, entry, detected_gender, similarity, classifier_confidence, classifier_probabilities = (
-                    self.match_result_queue.get_nowait()
-                )
+                (
+                    digest,
+                    entry,
+                    detected_gender,
+                    similarity,
+                    percentile,
+                    classifier_confidence,
+                    classifier_probabilities,
+                ) = self.match_result_queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -1599,7 +631,7 @@ class CelebrityMatcherApp:
                 continue
 
             self.dataset_warning_shown = False
-            self._apply_match_entry(entry, similarity)
+            self._apply_match_entry(entry, similarity, percentile)
             self._update_gender_status(resolved_gender, resolved_confidence)
 
     def _match_worker_loop(self) -> None:
@@ -1646,10 +678,10 @@ class CelebrityMatcherApp:
                     allowed = [classifier_label]
                 elif predicted_gender in ("male", "female") and classifier_label not in ("male", "female"):
                     allowed = [predicted_gender]
-                match_entry, similarity = self.dataset.best_match_from_embedding(embedding, allowed)
+                match_entry, similarity, percentile = self.dataset.best_match_from_embedding(embedding, allowed)
             except FileNotFoundError:
                 try:
-                    self.match_result_queue.put_nowait((digest, None, detected_gender, None, 0.0, None))
+                    self.match_result_queue.put_nowait((digest, None, detected_gender, None, None, 0.0, None))
                 except queue.Full:
                     pass
                 continue
@@ -1666,6 +698,7 @@ class CelebrityMatcherApp:
                         match_entry,
                         gender_for_queue,
                         similarity,
+                        percentile,
                         classifier_confidence if gender_for_queue in ("male", "female") else 0.0,
                         classifier_probabilities,
                     )
@@ -1677,6 +710,7 @@ class CelebrityMatcherApp:
         self,
         entry: CelebrityEntry,
         similarity: Optional[float],
+        percentile: Optional[float] = None,
         *,
         friendly_name: Optional[str] = None,
     ) -> None:
@@ -1688,7 +722,7 @@ class CelebrityMatcherApp:
         self.match_result.config(text=f"Closest celebrity match: {friendly}")
         self.display_celebrity_entry(entry, friendly)
         if self.similarity_label is not None:
-            self.similarity_label.config(text=self._format_similarity(similarity))
+            self.similarity_label.config(text=self._format_similarity(similarity, percentile))
 
     def run_match(self) -> None:
         messagebox.showinfo(
@@ -1697,7 +731,7 @@ class CelebrityMatcherApp:
         )
 
     def display_celebrity_entry(self, entry: CelebrityEntry, friendly_name: Optional[str] = None) -> None:
-        display_image = entry.thumbnail.copy() if entry.thumbnail else entry.image.copy()
+        display_image = entry.primary_thumbnail.copy() if entry.primary_thumbnail else entry.primary_image.copy()
         resolved_name = friendly_name or format_display_name(entry.name)
         self.celebrity_photo = ImageTk.PhotoImage(display_image)
         self.celebrity_label.config(image=self.celebrity_photo, text=resolved_name)
@@ -1706,7 +740,7 @@ class CelebrityMatcherApp:
         self,
         image: Image.Image,
         allowed_genders: Optional[List[str]] = None,
-    ) -> Tuple[CelebrityEntry, float]:
+    ) -> Tuple[CelebrityEntry, float, float]:
         return self.dataset.best_match(
             image,
             self.face_detector,
@@ -1715,56 +749,133 @@ class CelebrityMatcherApp:
             self.gender_classifier,
         )
 
-    def toggle_freeze(self) -> None:
+    def capture_snapshot(self) -> None:
         if not self.camera_running:
-            messagebox.showwarning("Freeze Frame", "Start the camera before freezing a frame.")
+            messagebox.showwarning("Capture Photo", "Start the camera before capturing a photo.")
             return
         if self.latest_frame is None:
-            messagebox.showwarning("Freeze Frame", "No camera frame available to freeze.")
+            messagebox.showwarning("Capture Photo", "No camera frame available to capture.")
             return
 
-        if not self.is_frozen:
-            self.is_frozen = True
-            self.frozen_frame = self.latest_frame.copy()
-            if self.freeze_button is not None:
-                self.freeze_button.config(text="Resume Camera")
+        frame_copy = self.latest_frame.copy()
+        self.latest_frame = frame_copy.copy()
+        self._disable_controls_for_snapshot()
+        if self.camera_running:
             self._stop_live_matching()
-            self._update_freeze_status("Frozen", "orange")
-            self.match_result.config(text="Analyzing frozen frame...")
-            self._run_frozen_match()
-        else:
-            self.is_frozen = False
-            self.frozen_frame = None
-            if self.freeze_button is not None:
-                self.freeze_button.config(text="Freeze Frame")
-            self.match_result.config(text="Resumed live matching.")
-            self._update_freeze_status("Live", "green")
+        if self.camera_capture is not None:
+            self.camera_capture.release()
+            self.camera_capture = None
+        self.camera_running = False
+        self.latest_face_array = None
+        self.last_sent_frame_digest = None
+        self.last_sent_frame_time = 0.0
+        self._show_captured_frame(frame_copy)
+
+        self._update_freeze_status("Capturing", "orange")
+        self.match_result.config(text="Analyzing captured photo...")
+        should_restart = False
+
+        def worker() -> None:
+            try:
+                snapshot_image = Image.fromarray(frame_copy.astype("uint8"))
+            except Exception:
+                self.root.after(
+                    0,
+                    lambda: self._conclude_snapshot_error(should_restart, "Unable to process captured photo."),
+                )
+                return
+
+            try:
+                self.dataset.require_entries(self.face_detector, self.face_embedder, self.gender_classifier, wait=True)
+            except Exception as exc:
+                message = str(exc) if str(exc) else "Celebrity dataset is unavailable."
+                self.root.after(0, lambda: self._conclude_snapshot_error(should_restart, message))
+                return
+
+            try:
+                face_crop = extract_face_region(snapshot_image, self.face_detector)
+                face_array = np.array(face_crop)
+            except Exception:
+                self.root.after(
+                    0,
+                    lambda: self._conclude_snapshot_error(should_restart, "No face detected in captured photo."),
+                )
+                return
+
+            try:
+                embedding = self.face_embedder.embed(face_array)
+            except Exception:
+                self.root.after(
+                    0,
+                    lambda: self._conclude_snapshot_error(should_restart, "Failed to compute face embedding."),
+                )
+                return
+
+            detected_gender = "unknown"
+            detected_confidence = 0.0
+            if self.gender_classifier is not None:
+                try:
+                    detected_gender, detected_confidence, _ = self.gender_classifier.classify(face_crop)
+                except Exception:
+                    detected_gender = "unknown"
+                    detected_confidence = 0.0
+
+            allowed: Optional[List[str]] = None
+            if detected_gender in ("male", "female") and detected_confidence >= 0.7:
+                allowed = [detected_gender]
+            elif self.current_face_gender in ("male", "female") and self.current_gender_confidence >= 0.7:
+                allowed = [self.current_face_gender]
+
+            try:
+                match_entry, similarity, percentile = self.dataset.best_match_from_embedding(embedding, allowed)
+            except Exception:
+                self.root.after(
+                    0,
+                    lambda: self._conclude_snapshot_error(should_restart, "Matching failed for captured photo."),
+                )
+                return
+
+            self.root.after(
+                0,
+                lambda: self._conclude_snapshot_success(
+                    should_restart,
+                    match_entry,
+                    similarity,
+                    percentile,
+                    detected_gender,
+                    detected_confidence,
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _conclude_snapshot_success(
+        self,
+        should_restart: bool,
+        entry: CelebrityEntry,
+        similarity: float,
+        percentile: float,
+        detected_gender: str,
+        detected_confidence: float,
+    ) -> None:
+        self._apply_match_entry(entry, similarity, percentile)
+        if detected_gender in ("male", "female"):
+            self._update_gender_status(detected_gender, detected_confidence)
+        self.match_result.config(text="Snapshot analysis complete.")
+        self._finalize_snapshot_ui(should_restart)
+
+    def _conclude_snapshot_error(self, should_restart: bool, message: str) -> None:
+        self.match_result.config(text=message)
+        self._finalize_snapshot_ui(should_restart)
+
+    def _finalize_snapshot_ui(self, should_restart: bool) -> None:
+        self._restore_controls_after_snapshot()
+        self.image_status.config(text="Captured photo displayed. Click 'Use Camera' to capture again.")
+        if should_restart and self.camera_running:
             self._start_live_matching()
-            self._update_camera_frame()
-
-    def _run_frozen_match(self) -> None:
-        if self.frozen_frame is None:
-            return
-
-        try:
-            frozen_image = Image.fromarray(self.frozen_frame.astype("uint8"))
-        except Exception:
-            self.match_result.config(text="Unable to process frozen frame.")
-            return
-
-        allowed = [self.current_face_gender] if self.current_face_gender in ("male", "female") else None
-
-        try:
-            match_entry, similarity = self.match_celebrity(frozen_image, allowed)
-        except FileNotFoundError as exc:
-            self.match_result.config(text=str(exc))
-            return
-        except Exception:
-            self.match_result.config(text="Matching failed for frozen frame.")
-            return
-
-        self._apply_match_entry(match_entry, similarity)
-        self.match_result.config(text="Frozen frame analysis complete.")
+            self._update_freeze_status("Live", "green")
+        else:
+            self._update_freeze_status("Idle", "grey")
 
     def on_close(self) -> None:
         self.stop_camera()

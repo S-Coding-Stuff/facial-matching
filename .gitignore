@@ -7,6 +7,15 @@ models/
 *.jpeg
 *.bmp
 
+# Generated caches and artifacts
+.cache/
+*.npy
+*.ann
+*.onnx
+*.safetensors
+hf-cache/
+**/manifest.json
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -14,3 +23,7 @@ __pycache__/
 # Virtual environments
 PyDev_Env/
 venv/
+venv*/
+
+# OS metadata
+.DS_Store

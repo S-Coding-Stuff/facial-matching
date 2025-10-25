@@ -6,11 +6,12 @@ An interactive Tkinter desktop app that matches a live (or uploaded) face image 
 
 - Tkinter GUI with live camera preview, freeze/resume toggle, and inline status indicators (including dataset loading progress).
 - OpenCV YuNet (downloaded automatically from Hugging Face via `huggingface-hub`) for fast CPU-only face detection.
-- ArcFace ResNet-100 INT8 (ONNX + `onnxruntime`) for generating 512‑D embeddings, pre-warmed for low-latency cosine similarity lookups via Annoy.
+- ArcFace ResNet-100 INT8 (ONNX + `onnxruntime`) for generating 512‑D embeddings, pre-warmed for low-latency cosine similarity lookups via cached dot-products.
 - Lightweight MobileNetV3 gender classifier (INT8 ONNX) with exponential smoothing to stabilise frame-to-frame predictions and provide confidence estimates.
 - Cosine similarity gauge that translates the raw embedding score into an easy-to-read percentage plus qualitative band (“very low” → “high”).
+- One-click “Capture Photo” workflow to analyze the current frame, with on-screen progress feedback.
 - Automatic dataset refresh: new celebrity images or metadata dropped into `celebrity_dataset/` are detected on the fly and trigger a background rebuild of embeddings.
-- Persistent cache (`celebrity_dataset/.cache/`) stores face crops, embeddings, and Annoy indexes so restarts reuse precomputed data.
+- Persistent cache (`celebrity_dataset/.cache/`) stores face crops, embeddings, and cached similarity data so restarts reuse precomputed results.
 - Asynchronous worker that performs matching without blocking the UI.
 - CLI scraper (`celebrity_scraper.py`) to download portraits + metadata from Wikimedia/Wikidata with face-count validation.
 
